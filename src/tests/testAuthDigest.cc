@@ -444,6 +444,12 @@ TestAuthDigest::testCapacityTableMatchesParser()
 
     CPPUNIT_ASSERT_EQUAL(size_t(65536), UniversalValueLengthBound);
     CPPUNIT_ASSERT_EQUAL(UniversalValueLengthBound, EffectiveValueLengthLimit(DIGEST_URI));
+    /* the realm and the cnonce stated as the numbers themselves as well, these being
+     * the two rows a length checked after the parsing loop never repeats, so that a
+     * rule or a capacity changed above cannot leave them at the universal bound
+     * unnoticed */
+    CPPUNIT_ASSERT_EQUAL(size_t(1024), EffectiveValueLengthLimit(DIGEST_REALM));
+    CPPUNIT_ASSERT_EQUAL(size_t(256), EffectiveValueLengthLimit(DIGEST_CNONCE));
     for (auto i = 0; i < DIGEST_INVALID_ATTR; ++i) {
         const auto type = static_cast<DigestFieldId>(i);
         if (type != DIGEST_URI) {
@@ -517,6 +523,10 @@ TestAuthDigest::testMaximumLengthFields()
     AssertLengthAdmitted(DIGEST_REALM, 1023);
     AssertLengthAdmitted(DIGEST_REALM, 1024);
     AssertLengthRejected(DIGEST_REALM, 1025);
+    /* the shortest realm measured to overrun the helper request line, and with it the
+     * newline framing that line, so that the helper waits for a line it never
+     * receives */
+    AssertLengthRejected(DIGEST_REALM, 8177);
     AssertLengthRejected(DIGEST_REALM, 8192);
     AssertLengthRejected(DIGEST_REALM, UniversalValueLengthBound);
 
@@ -545,7 +555,12 @@ TestAuthDigest::testMaximumLengthFields()
     AssertLengthAdmitted(DIGEST_CNONCE, 255);
     AssertLengthAdmitted(DIGEST_CNONCE, 256);
     AssertLengthRejected(DIGEST_CNONCE, 257);
+    AssertLengthRejected(DIGEST_CNONCE, 1025);
     AssertLengthRejected(DIGEST_CNONCE, 4096);
+    AssertLengthRejected(DIGEST_CNONCE, 8192);
+    /* the lengths a client could once make this parser allocate before any credential
+     * had been verified */
+    AssertLengthRejected(DIGEST_CNONCE, 60000);
     AssertLengthRejected(DIGEST_CNONCE, UniversalValueLengthBound);
 }
 
