@@ -96,7 +96,9 @@ static_assert(sizeof(DigestFieldNames) / sizeof(DigestFieldNames[0]) == Recogniz
 constexpr size_t UniversalValueLengthBound = 65536;
 
 static_assert(UniversalValueLengthBound == ((3 * 64 * 1024 - 1) + 1) / 3);
-static_assert(UniversalValueLengthBound == 64 * 1024);
+// the second restatement multiplies in size_t rather than int so that the
+// comparison needs no implicit widening of a narrower product
+static_assert(UniversalValueLengthBound == static_cast<size_t>(64) * 1024);
 
 /// How DigestFieldCapacities[] constrains a field's value length. Mirrors the
 /// production DigestLengthRule in order, and in membership for every rule a
