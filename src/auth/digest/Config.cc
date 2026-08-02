@@ -85,6 +85,267 @@ digestFieldsLookupTable()
     return *table;
 }
 
+/* Destination capacity contract for the Digest credential fields parsed by
+ * Auth::Digest::Config::decode() below.
+ *
+ * decode() runs on unauthenticated input, before any credential is verified and
+ * before the authentication helper is consulted. Each field value is therefore
+ * checked against the capacity of its destination before being copied there:
+ * the table below declares that capacity per field, and decode() consults it
+ * once per recognized field, before dispatching to the case that copies the
+ * value, so the check belongs to the extraction loop rather than to nine
+ * separate switch cases. A new http_digest_attr_type enumerator cannot reach a
+ * copy unguarded: without a matching capacity row the static_assert() on
+ * DigestFieldCapacitiesAreWellFormed() fails to compile, and without a case of
+ * its own it fails the exhaustive switch, which deliberately has no default
+ * label.
+ */
+namespace {
+
+enum class DigestLengthRule {
+    exact, ///< the capacity is the only length the field admits
+    atMost, ///< the capacity is the greatest length the field admits
+    /// the greatest length the field admits is String::RawSizeMaxXXX(), which
+    /// the row names instead of storing because it is a static member function
+    /// rather than a constant expression
+    rawSizeMax,
+    any ///< the field declares no length of its own; only the universal bound applies
+};
+
+class DigestFieldCapacity
+{
+public:
+    http_digest_attr_type id;
+    DigestLengthRule rule;
+    /// the value length in bytes that DigestLengthRule::exact and
+    /// DigestLengthRule::atMost compare against; the remaining rules name their
+    /// limit rather than storing one and leave this zero
+    String::size_type capacity;
+};
+
+/// The length contract of every Digest credential field, indexed by
+/// http_digest_attr_type. A field whose accepted values have a fixed or an
+/// enumerated length carries that exact or maximum length, so that its row
+/// repeats, earlier, a length the validation below already requires. A field
+/// whose accepted values have no such length carries a maximum this contract
+/// imposes, with the reason recorded on the row itself. A field which nothing
+/// narrows at all says so by naming the shared String::RawSizeMaxXXX() bound as
+/// its own limit rather than adding a narrower number that nothing justifies.
+/// DigestFieldLengthOk() applies the universal String::RawSizeMaxXXX() bound to
+/// every field before consulting its row here, so a row restates that bound only
+/// where it is also the field's own declared limit.
+constexpr DigestFieldCapacity DigestFieldCapacities[] = {
+    /* The username and the realm are the two fields this parser hands to the
+     * authentication helper, and the helper request line is what makes a long
+     * value harmful rather than merely large.
+     * Auth::Digest::UserRequest::startHelperLookup()
+     * (src/auth/digest/UserRequest.cc:274-297) composes that line into a
+     * char buf[8192] with snprintf(buf, 8192, "\"%s\":\"%s\"\n", username,
+     * realm), or, when "auth_param digest key_extras" is configured, with
+     * snprintf(buf, 8192, "\"%s\":\"%s\" %s\n", username, realm, keyExtras).
+     * snprintf() writes at most 8191 characters and a terminator, so a longer
+     * line loses its trailing bytes, and the byte it loses first is the newline
+     * which frames the request: truncation may therefore leave the helper
+     * waiting for a line it never receives, or run the request into whatever is
+     * written after it. Truncating either field is therefore not benign, and
+     * 1024 bytes each keep the two of them within 2048 of the 8192 available.
+     * That does not by itself guarantee that the whole line fits, because the
+     * framing bytes and any configured key_extras expansion share the same
+     * buffer, and the length of that expansion is an operator's configuration
+     * choice (src/cf.data.pre:647-669, assembled by
+     * Auth::UserRequest::helperRequestKeyExtras(),
+     * src/auth/UserRequest.cc:560-574) which this parser neither sees nor
+     * bounds. The limit also bounds what one unauthenticated request can make
+     * this parser allocate for either field. The check runs on the arriving
+     * value and again on the transcoded value, which is what gets copied. */
+    {DIGEST_USERNAME, DigestLengthRule::atMost, 1024},
+
+    /* The realm is the other field on the helper request line described above,
+     * and the same 1024 bytes bound what it contributes to it. A client echoes
+     * the value Auth::Digest::Config::fixHeader() below issued from the
+     * configured "auth_param digest realm"; the validation below never compares
+     * the two, and the helper lookup is keyed on the echo, so this row alone
+     * holds it to a length that line can carry. Those 1024 bytes are this
+     * contract's share of the 8192 rather than the length at which snprintf()
+     * truncates.
+     * Configuration does not impose this limit: the "realm" branch of
+     * Auth::SchemeConfig::parse() (src/auth/SchemeConfig.cc) accepts a realm of
+     * any length, and fixHeader() advertises whatever it accepted. A realm
+     * configured longer than 1024 bytes is therefore issued in the challenge but
+     * rejected here when a client echoes it, which leaves such a realm unusable
+     * rather than merely long. */
+    {DIGEST_REALM, DigestLengthRule::atMost, 1024},
+
+    /* The validation below accepts only a qop equal to QOP_AUTH, which
+     * src/auth/digest/Config.h:101 defines as the four bytes "auth", so a
+     * longer value is already rejected there; 8 leaves headroom for the
+     * existing "Invalid qop option received" diagnostic to report near misses
+     * instead of being pre-empted by a length rejection */
+    {DIGEST_QOP, DigestLengthRule::atMost, 8},
+
+    /* the validation below accepts only "MD5" and "MD5-sess", the longer of
+     * which is 8 bytes, so a longer value is already rejected there */
+    {DIGEST_ALGORITHM, DigestLengthRule::atMost, 8},
+
+    /* Request targets are legitimately long, and unlike the fields above
+     * nothing further down narrows this one: the validation below rejects only
+     * an empty uri. Its limit is therefore String::RawSizeMaxXXX(), which
+     * src/SquidString.h:74-76 defines as the conservative ceiling for raw input
+     * that later processing may grow -- a third of the String::SizeMaxXXX()
+     * absolute limit, not that limit itself -- and which this codebase already
+     * applies to attacker-supplied input elsewhere (src/http.cc:1972,
+     * src/http/one/RequestParser.cc:143). The row names that bound, rather than
+     * storing a narrower number of its own, so that this field declares the
+     * limit it is held to instead of leaving it to be inferred from the absence
+     * of one. Note that a credential does not usually reach this length:
+     * HttpHeaderEntry::parse() (src/HttpHeader.cc:1619) refuses a header field
+     * value longer than 65534 bytes, and it does so before these credentials are
+     * split into fields, so a uri that long is normally answered as a malformed
+     * header rather than as a disallowed field length. The bound is still stated
+     * here, because a limit which another parser happens to apply first is not
+     * this parser's to rely on. */
+    {DIGEST_URI, DigestLengthRule::rawSizeMax, 0},
+
+    /* Squid accepts only a nonce it generated itself, and
+     * authDigestNonceEncode() below builds every one of those with
+     * xcalloc(sizeof(HASHHEX), 1) and CvtHex(), that is with exactly HASHHEXLEN
+     * bytes (include/rfc2617.h:28-29). authenticateDigestNonceFindNonce() below
+     * therefore fails to match a value of any other length, however long it is;
+     * 256 is eightfold headroom above the 32 bytes that can match */
+    {DIGEST_NONCE, DigestLengthRule::atMost, 256},
+
+    /* RFC 7616 section 3.4 makes the nonce-count 8 hexadecimal digits, the
+     * validation below rejects any nc whose length is not 8, and the
+     * destination is the fixed char nc[9] of
+     * src/auth/digest/UserRequest.h:52; the DIGEST_NC case below ties this row
+     * to sizeof(nc) with a static_assert() so that the limit and the buffer it
+     * protects cannot drift apart */
+    {DIGEST_NC, DigestLengthRule::exact, 8},
+
+    /* A client-chosen opaque value which nothing else constrains: the validation
+     * below rejects only an empty cnonce, and
+     * src/auth/digest/UserRequest.cc:100-107 passes whatever arrived to
+     * DigestCalcHA1() and DigestCalcResponse(), which hash it without a length
+     * limit. RFC 7616 section 3.4 fixes no length for it either, so 256 is a
+     * limit this contract imposes rather than one a check further down already
+     * implies, and it is what keeps this pre-authentication copy finite. It is
+     * eightfold the HASHHEXLEN bytes (include/rfc2617.h:28-29) of the nonce the
+     * cnonce accompanies, that being the only comparable length this scheme
+     * fixes */
+    {DIGEST_CNONCE, DigestLengthRule::atMost, 256},
+
+    /* include/rfc2617.h:28-29 fix an MD5 hexadecimal digest at HASHHEXLEN
+     * bytes (typedef char HASHHEX[HASHHEXLEN + 1]), and the validation below
+     * already rejects any response whose length is not that */
+    {DIGEST_RESPONSE, DigestLengthRule::exact, HASHHEXLEN},
+
+    /* attributes that digestFieldsLookupTable() does not recognize are reported
+     * and skipped before the extraction switch below, so nothing is copied for
+     * them and no destination capacity applies */
+    {DIGEST_INVALID_ATTR, DigestLengthRule::any, 0}
+};
+
+/**
+ * Whether DigestFieldCapacities[] still describes http_digest_attr_type
+ * exactly. Checked at compile time so that extending the enumeration without
+ * declaring the new field's destination capacity is a build failure rather than
+ * a silently unguarded copy.
+ *
+ \retval true  the table holds one row per enumerator, each stored at the index
+               of the enumerator it describes and each carrying a capacity only
+               if its rule compares against one
+ \retval false the table and the enumeration have drifted apart, or a row's rule
+               and capacity disagree
+ */
+constexpr bool
+DigestFieldCapacitiesAreWellFormed()
+{
+    if (sizeof(DigestFieldCapacities) / sizeof(DigestFieldCapacities[0]) != static_cast<size_t>(DIGEST_INVALID_ATTR) + 1)
+        return false;
+    for (auto i = 0; i <= DIGEST_INVALID_ATTR; ++i) {
+        const auto &limit = DigestFieldCapacities[i];
+        if (static_cast<int>(limit.id) != i)
+            return false;
+        /* a rule which compares against the stored capacity needs one, and a
+         * rule which names its limit instead must not also store a second one
+         * that nothing reads */
+        const auto comparesAgainstCapacity = (limit.rule == DigestLengthRule::exact || limit.rule == DigestLengthRule::atMost);
+        if (comparesAgainstCapacity != (limit.capacity > 0))
+            return false;
+    }
+    return true;
+}
+
+static_assert(DigestFieldCapacitiesAreWellFormed());
+
+/**
+ * Whether a Digest credential field value of the given byte length may be
+ * copied into the destination that Auth::Digest::Config::decode() keeps for
+ * that field. The length must satisfy both the universal
+ * String::RawSizeMaxXXX() bound and the DigestFieldCapacities[] rule of its
+ * field, which for DIGEST_NC and DIGEST_RESPONSE is an exact length rather than
+ * a maximum. decode() calls this before dispatching to the case which performs
+ * the copy, so that a value of a length the destination does not admit is
+ * rejected without being copied, and reports the rejection here so that all
+ * callers share one diagnostic.
+ *
+ * Rejection is not fatal, and it is not signalled by the absence of the field:
+ * decode() records it explicitly and then fails the whole credentials through
+ * authDigestLogUsername(), because a field left absent is indistinguishable
+ * from one that was never sent and the optional fields would otherwise be
+ * defaulted rather than rejected.
+ *
+ \param type[in]    the credential field being extracted, as resolved by
+                    digestFieldsLookupTable(); any http_digest_attr_type
+                    enumerator is accepted
+ \param keyName[in] the field name as it appeared in the credentials, used only
+                    for reporting
+ \param length[in]  the length in bytes of the value decode() is about to copy;
+                    for DIGEST_USERNAME decode() submits the length as it
+                    arrived and, when transcoding to UTF-8 rewrites the value,
+                    the length transcoding produced, which can be greater
+ \retval true  the destination admits a value of this length
+ \retval false the length exceeds the universal String::RawSizeMaxXXX() bound or
+               this field's declared capacity, or differs from the single length
+               a fixed-length field admits, and the value must not be copied
+ */
+bool
+DigestFieldLengthOk(const http_digest_attr_type type, const SBuf &keyName, const String::size_type length)
+{
+    /* the universal bound comes first so that it holds whatever a field's own
+     * rule turns out to be; it is applied here rather than in the table above
+     * because String::RawSizeMaxXXX() is a static member function, not a
+     * constexpr constant, which is also why a field whose capacity is exactly
+     * that bound names it in its rule instead of storing it as a number */
+    auto fits = length <= String::RawSizeMaxXXX();
+
+    if (fits) {
+        // DigestFieldCapacitiesAreWellFormed() guarantees a row for every
+        // enumerator, and digestFieldsLookupTable() only ever yields enumerators
+        const auto &limit = DigestFieldCapacities[type];
+        switch (limit.rule) {
+        case DigestLengthRule::exact:
+            fits = (length == limit.capacity);
+            break;
+        case DigestLengthRule::atMost:
+            fits = (length <= limit.capacity);
+            break;
+        case DigestLengthRule::rawSizeMax:
+            fits = (length <= String::RawSizeMaxXXX());
+            break;
+        case DigestLengthRule::any:
+            break;
+        }
+    }
+
+    if (!fits)
+        debugs(29, 3, "Rejecting Digest credential field " << keyName << " with a disallowed value length of " << length << " bytes");
+
+    return fits;
+}
+
+} // namespace
+
 /*
  *
  * Nonce Functions
@@ -723,6 +984,22 @@ Auth::Digest::Config::decode(char const *proxy_auth, const HttpRequest *request,
 
     String temp(proxy_auth);
 
+    bool malformedFieldLength = false;
+
+    /* Applies the DigestFieldCapacities[] contract to one credential field value
+     * and records any rejection in malformedFieldLength, so that both the check
+     * and its bookkeeping belong to the extraction loop rather than to nine
+     * independently maintained cases. The parameters are those of
+     * DigestFieldLengthOk(), named differently only to keep them distinct from
+     * the per-attribute variables of the loop below.
+     */
+    const auto fieldLengthOk = [&malformedFieldLength](const http_digest_attr_type fieldType, const SBuf &fieldName, const String::size_type valueLength) {
+        if (DigestFieldLengthOk(fieldType, fieldName, valueLength))
+            return true;
+        malformedFieldLength = true;
+        return false;
+    };
+
     while (strListGetItem(&temp, ',', &item, &ilen, &pos)) {
         /* isolate directive name & value */
         size_t nlen;
@@ -773,83 +1050,117 @@ Auth::Digest::Config::decode(char const *proxy_auth, const HttpRequest *request,
         /* find type */
         const auto t = digestFieldsLookupTable().lookup(keyName);
 
-        switch (t) {
-        case DIGEST_USERNAME:
-            safe_free(username);
-            if (value.size() != 0) {
-                const auto v = value.termedBuf();
-                if (utf8 && !isValidUtf8String(v, v + value.size())) {
-                    auto str = isCP1251EncodingAllowed(request) ? Cp1251ToUtf8(v) : Latin1ToUtf8(v);
-                    value = SBufToString(str);
-                }
-                username = xstrndup(value.rawBuf(), value.size() + 1);
-            }
-            debugs(29, 9, "Found Username '" << username << "'");
-            break;
+        /* unrecognized attributes are skipped here rather than by the switch
+         * below: nothing is copied for them, so they have no destination whose
+         * capacity could be checked, and checking them anyway would reject
+         * credentials merely for carrying a long unknown attribute */
+        if (t == DIGEST_INVALID_ATTR) {
+            debugs(29, 3, "Unknown attribute '" << item << "' in '" << temp << "'");
+            continue;
+        }
 
-        case DIGEST_REALM:
-            safe_free(digest_request->realm);
-            if (value.size() != 0)
-                digest_request->realm = xstrndup(value.rawBuf(), value.size() + 1);
-            debugs(29, 9, "Found realm '" << digest_request->realm << "'");
-            break;
-
-        case DIGEST_QOP:
-            safe_free(digest_request->qop);
-            if (value.size() != 0)
-                digest_request->qop = xstrndup(value.rawBuf(), value.size() + 1);
-            debugs(29, 9, "Found qop '" << digest_request->qop << "'");
-            break;
-
-        case DIGEST_ALGORITHM:
-            safe_free(digest_request->algorithm);
-            if (value.size() != 0)
-                digest_request->algorithm = xstrndup(value.rawBuf(), value.size() + 1);
-            debugs(29, 9, "Found algorithm '" << digest_request->algorithm << "'");
-            break;
-
-        case DIGEST_URI:
-            safe_free(digest_request->uri);
-            if (value.size() != 0)
-                digest_request->uri = xstrndup(value.rawBuf(), value.size() + 1);
-            debugs(29, 9, "Found uri '" << digest_request->uri << "'");
-            break;
-
-        case DIGEST_NONCE:
-            safe_free(digest_request->noncehex);
-            if (value.size() != 0)
-                digest_request->noncehex = xstrndup(value.rawBuf(), value.size() + 1);
-            debugs(29, 9, "Found nonce '" << digest_request->noncehex << "'");
-            break;
-
-        case DIGEST_NC:
-            if (value.size() == 8) {
-                // for historical reasons, the nc value MUST be exactly 8 bytes
-                static_assert(sizeof(digest_request->nc) == 8 + 1);
-                xstrncpy(digest_request->nc, value.rawBuf(), value.size() + 1);
-                debugs(29, 9, "Found noncecount '" << digest_request->nc << "'");
-            } else {
+        /* The check that guards every copy below. It runs on the value as it
+         * arrived, before the username rewriting below, because no conversion
+         * that rewriting performs can shrink a value: Latin1ToUtf8() expands a
+         * high byte into two bytes and Cp1251ToUtf8() into up to three, and
+         * neither ever emits fewer bytes than it read (src/auth/toUtf.cc). A
+         * value already longer than its field admits is therefore still too long
+         * once converted, so rejecting it here spares the conversion of a value
+         * that could not have been stored either way.
+         */
+        if (!fieldLengthOk(t, keyName, value.size())) {
+            /* nc is the one field whose destination has a fixed size, and it gets
+             * two things the other eight do not. Its own diagnostic names the
+             * offending value, which the length diagnostic above does not, since
+             * that one reports the field and the length alone. Clearing the
+             * destination keeps a wrong-length nc from leaving in place an nc that
+             * an earlier item of the same credentials stored, which the rejection
+             * below makes unusable but does not itself undo.
+             */
+            if (t == DIGEST_NC) {
                 debugs(29, 9, "Invalid nc '" << value << "' in '" << temp << "'");
                 digest_request->nc[0] = 0;
             }
             break;
+        }
+
+        /* The username is the only field this parser rewrites before copying it.
+         * The length of the value it rewrites has been checked above; the length
+         * of the value rewriting produces is checked again here, before that
+         * value is stored, because the conversion can lengthen it and because a
+         * String longer than String::SizeMax_ bytes asserts in
+         * String::setBuffer() instead of failing cleanly.
+         */
+        if (t == DIGEST_USERNAME && value.size() != 0) {
+            const auto v = value.termedBuf();
+            if (utf8 && !isValidUtf8String(v, v + value.size())) {
+                const auto str = isCP1251EncodingAllowed(request) ? Cp1251ToUtf8(v) : Latin1ToUtf8(v);
+                if (!fieldLengthOk(t, keyName, str.length()))
+                    break;
+                value = SBufToString(str);
+            }
+        }
+
+        /* The only place where a checked credential field value becomes a
+         * heap-allocated C string. Routing every field through it keeps a case
+         * below from copying a value that has not been through the check above,
+         * and keeps the diagnostic inside the branch that made the field
+         * non-nil, an empty value leaving it nil.
+         */
+        const auto storeField = [&value](char * &field, const char * const description) {
+            safe_free(field);
+            if (value.size() != 0) {
+                field = xstrndup(value.rawBuf(), value.size() + 1);
+                debugs(29, 9, "Found " << description << " '" << field << "'");
+            }
+        };
+
+        switch (t) {
+        case DIGEST_USERNAME:
+            storeField(username, "Username");
+            break;
+
+        case DIGEST_REALM:
+            storeField(digest_request->realm, "realm");
+            break;
+
+        case DIGEST_QOP:
+            storeField(digest_request->qop, "qop");
+            break;
+
+        case DIGEST_ALGORITHM:
+            storeField(digest_request->algorithm, "algorithm");
+            break;
+
+        case DIGEST_URI:
+            storeField(digest_request->uri, "uri");
+            break;
+
+        case DIGEST_NONCE:
+            storeField(digest_request->noncehex, "nonce");
+            break;
+
+        case DIGEST_NC:
+            // for historical reasons, the nc value MUST be exactly 8 bytes
+            static_assert(sizeof(digest_request->nc) == DigestFieldCapacities[DIGEST_NC].capacity + 1);
+            xstrncpy(digest_request->nc, value.rawBuf(), value.size() + 1);
+            debugs(29, 9, "Found noncecount '" << digest_request->nc << "'");
+            break;
 
         case DIGEST_CNONCE:
-            safe_free(digest_request->cnonce);
-            if (value.size() != 0)
-                digest_request->cnonce = xstrndup(value.rawBuf(), value.size() + 1);
-            debugs(29, 9, "Found cnonce '" << digest_request->cnonce << "'");
+            storeField(digest_request->cnonce, "cnonce");
             break;
 
         case DIGEST_RESPONSE:
-            safe_free(digest_request->response);
-            if (value.size() != 0)
-                digest_request->response = xstrndup(value.rawBuf(), value.size() + 1);
-            debugs(29, 9, "Found response '" << digest_request->response << "'");
+            storeField(digest_request->response, "response");
             break;
 
-        default:
-            debugs(29, 3, "Unknown attribute '" << item << "' in '" << temp << "'");
+        case DIGEST_INVALID_ATTR:
+            /* unreachable: unrecognized attributes are skipped above. This case
+             * exists so that the switch stays exhaustive without a default
+             * label, making a new http_digest_attr_type that reaches a copy
+             * without a case of its own a compilation error.
+             */
             break;
         }
     }
@@ -871,6 +1182,23 @@ Auth::Digest::Config::decode(char const *proxy_auth, const HttpRequest *request,
 
     // return value.
     Auth::UserRequest::Pointer rv;
+
+    /* Rejecting here, ahead of the checks below, keeps a rejected optional field
+     * from being mistaken for an omitted one and quietly defaulted. The outcome
+     * is the one every other rejection below produces: an Auth::Digest::User
+     * marked Auth::AUTH_BROKEN, for which Auth::UserRequest::valid() is false,
+     * so that Auth::UserRequest::authenticate() answers AUTH_ACL_CHALLENGE and
+     * the client receives the standard 407 challenge on a forward-proxy port or
+     * 401 on an accelerator port. The offending field and the length of its
+     * value have already been reported above.
+     */
+    if (malformedFieldLength) {
+        debugs(29, 2, "Disallowed credential field length");
+        rv = authDigestLogUsername(username, digest_request, aRequestRealm);
+        safe_free(username);
+        return rv;
+    }
+
     /* do we have a username ? */
     if (!username || username[0] == '\0') {
         debugs(29, 2, "Empty or not present username");

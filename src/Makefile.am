@@ -1728,9 +1728,24 @@ tests_testACLMaxUserIP_LDADD = \
 	$(COMPAT_LIB) \
 	$(XTRA_LIBS)
 tests_testACLMaxUserIP_LDFLAGS = $(LIBADD_DL)
+
+check_PROGRAMS += tests/testAuthDigest
+tests_testAuthDigest_SOURCES = \
+	tests/testAuthDigest.cc
+nodist_tests_testAuthDigest_SOURCES = \
+	tests/stub_debug.cc \
+	tests/stub_libmem.cc
+tests_testAuthDigest_LDADD = \
+	sbuf/libsbuf.la \
+	base/libbase.la \
+	$(LIBCPPUNIT_LIBS) \
+	$(COMPAT_LIB) \
+	$(XTRA_LIBS)
+tests_testAuthDigest_LDFLAGS = $(LIBADD_DL)
 else
 EXTRA_DIST += \
-	tests/testACLMaxUserIP.cc
+	tests/testACLMaxUserIP.cc \
+	tests/testAuthDigest.cc
 endif
 
 ## Tests of html/*
